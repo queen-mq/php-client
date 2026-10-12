@@ -27,6 +27,7 @@ they apply.
 - [Ephemeral queues](#ephemeral-queues)
 - [Admin API](#admin-api)
 - [Tracing](#tracing)
+- [Binary push, push compression and framed pop](#binary-push-push-compression-and-framed-pop)
 - [HTTP transports](#http-transports)
 - [Retries, failover and 429](#retries-failover-and-429)
 - [Errors and exceptions](#errors-and-exceptions)
@@ -89,6 +90,9 @@ The constructor takes `string|array $config`:
 | `bearerToken` | `null` | Sent as `Authorization: Bearer <token>`. |
 | `headers` | `[]` | Extra headers on every request. |
 | `retry429` | `[]` | HTTP 429 backoff: `maxAttempts`, `baseMs`, `capMs`. See [Retries](#retries-failover-and-429). |
+| `binaryPush` | `false` | Send a push as a binary body instead of JSON. See [binary push](#binary-push-push-compression-and-framed-pop). |
+| `pushCompression` | `false` | With `binaryPush`: frame and compress each partition's batch in the client. Needs `ext-zstd`. |
+| `framedPop` | `false` | Ask for a pop's messages as the stored records and unpack them in the client. Needs `ext-zstd`. |
 
 The load-balancing keys have no effect with one URL. The constructor validates the config and
 throws `InvalidArgumentException` on the first problem:
@@ -98,7 +102,9 @@ throws `InvalidArgumentException` on the first problem:
 - `timeoutMillis`, `retryAttempts` and `affinityHashRing` are integers of at least 1;
   `retryDelayMillis` and `healthRetryAfterMillis` are integers of at least 0. A numeric string is
   accepted.
-- `enableFailover` is a boolean.
+- `enableFailover`, `binaryPush`, `pushCompression` and `framedPop` are booleans.
+- `framedPop`, or `binaryPush` with `pushCompression`, needs the zstd extension. Without it the
+  constructor throws `RuntimeException`.
 - `bearerToken` is `null` or a non-empty string without spaces or control characters. It replaces
   an `Authorization` entry in `headers`.
 - Header names are HTTP tokens. A value is a scalar or a list of scalars, without CR or LF.
@@ -1130,6 +1136,59 @@ $events = $queen->admin()->getTracesByName('order-8891');
 A push item can carry a `traceId`. The client sends it without validation, and the broker ignores
 a value that is not a UUID.
 
+## Binary push, push compression and framed pop
+
+Three client options change how messages travel between the client and the broker: `binaryPush`,
+`pushCompression` and `framedPop`. They are off by default, and off, the client sends and reads
+the JSON every broker knows. On, the calls, their return values, deduplication and the delivery
+guarantees are the same.
+
+```php
+$queen = new Queen([
+    'url' => 'http://localhost:6632',
+    'binaryPush' => true,
+    'pushCompression' => true,
+    'framedPop' => true,
+]);
+```
+
+| Option | Effect |
+| --- | --- |
+| `binaryPush` | A push, direct or buffered, sends its items as one length-prefixed binary body instead of a JSON document, with `Content-Type: application/x-queen-push`. The answer is the same per-item list. |
+| `pushCompression` | Needs `binaryPush`; alone it does nothing. The client frames each partition's batch the way the broker stores it, mints the message ids (UUIDv7) and compresses the batch with zstd, once. The broker checks the frames and, when it has nothing to add to them, stores those bytes without compressing them again. `commit()` sends a transaction's pushes the same way, with the rest of the bundle as JSON in front of them. |
+| `framedPop` | Every pop adds `frames=true`, and the client unpacks the stored records into the same message arrays. `pop()`, `popResult()`, `consume()` and `getConsumer()` return what they return with JSON, the `autopilot` echo included. |
+
+Turn them on when the broker's CPU or the network limits a high message rate: the framing, the
+compression and the unpacking then run in the clients, and the batches cross the network
+compressed.
+
+`pushCompression` and `framedPop` need the zstd extension (`pecl install zstd`); `composer.json`
+names `ext-zstd` under `suggest`. When an option needs it and it is not loaded, the constructor
+throws `RuntimeException('framedPop needs the zstd extension (pecl install zstd)')`, or the same
+message with `pushCompression`.
+
+These stay JSON, with nothing to do in your code:
+
+- A push with a `traceId` on one of its items.
+- A transaction with no push, or with a `traceId` on one of its pushes.
+- A pop the broker cannot answer in frames: a pop of a conflating group, and every pop on a
+  broker that runs with an encryption key (`QUEEN_ENCRYPTION_KEY`). The client recognises a
+  framed answer by its first bytes and reads a JSON answer as before.
+- Acks, key/value, timers, locks and the admin API. Ephemeral queues use their own routes and do
+  not change either.
+
+`commit()` returns `results` in the order of the builder's operations, as with JSON. The broker
+answers a binary transaction with the acks first and the pushes after them; the client puts them
+back and rewrites each `index`.
+
+The binary push and transaction bodies need a broker newer than 2.2.0. A broker up to 2.2.0
+answers them with HTTP 400 (an `HttpException`), and the client does not fall back to JSON:
+turn `binaryPush` and `pushCompression` on after every broker of the cluster is upgraded.
+`framedPop` is safe against any broker: an older one ignores the parameter and answers JSON.
+
+Under Laravel the same options are the `binary_push`, `push_compression` and `framed_pop` keys of
+`config/queen.php`: <https://queenmq.com/guides/laravel/configuration/#queue-driver>.
+
 ## HTTP transports
 
 The client sends synchronous and detached requests through its own cURL transport when it can, and
@@ -1152,7 +1211,8 @@ Both paths behave the same way:
 
 - HTTP/1.1 with keep-alive. TLS peer and host are verified. Redirects are not followed, so
   credentials never go to another host.
-- Headers: `Content-Type: application/json`, the configured `headers`, and
+- Headers: `Content-Type: application/json` (`application/x-queen-push` for a
+  [binary body](#binary-push-push-compression-and-framed-pop)), the configured `headers`, and
   `Authorization: Bearer <bearerToken>` when set.
 - Connect timeout 5 s; total timeout `timeoutMillis`, or the pop timeout plus 5 s for a pop.
 - A `204` answer returns `null`.

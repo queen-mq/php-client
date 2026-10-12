@@ -228,6 +228,9 @@ connection in `config/queue.php` win over them.
 | `lease_renewal` | `false` | keeps the lease alive under a running job |
 | `ack_async` | `false` | sends each ACK without waiting; the answer is read after the next job |
 | `pop_ahead` | `false` | pops the next batch while the last job of a full batch runs |
+| `binary_push` | `false` | sends a dispatched job as a binary push body instead of JSON |
+| `push_compression` | `false` | with `binary_push`: frames and compresses each pushed batch in the dispatching process |
+| `framed_pop` | `false` | pops the jobs as the stored records and unpacks them in the worker |
 
 Prefetch applies to each worker. Two workers with the default `prefetch=1` can execute two jobs
 at once, each holding one job. For one queue, with `pop_ahead` off and `prefetch=4`, they can
@@ -275,6 +278,17 @@ asynchronous ACK is reported one job later and the job is delivered again; `pop_
 `lease_renewal`, and `ack_async` needs `ack_batch` 1. With both, 32 workers on the Linux server
 went from 1,879 to 2,794 jobs/s of 10 ms jobs.
 [The fast profile](https://queenmq.com/guides/laravel/#fast).
+
+`binary_push`, `push_compression` and `framed_pop` change how the jobs travel between the driver
+and the broker, and nothing else: the jobs, their order and their delivery stay the same. With
+`binary_push` and `push_compression`, a job released without a delay, or handed back by a worker
+that stops, travels the same way inside its transaction. A delayed job is a timer and stays JSON.
+`push_compression` and `framed_pop` need the zstd PHP extension (`pecl install zstd`) in the
+workers and in every process that dispatches; without it the connection throws when it is built.
+The binary bodies need a broker newer than 2.2.0, and one up to 2.2.0 answers them with 400, so
+turn the two push settings on after the brokers are upgraded. `framed_pop` is safe against any
+broker.
+[Binary push, push compression and framed pop](REFERENCE.md#binary-push-push-compression-and-framed-pop).
 
 Keep `prefetch=1` for long jobs, strict per-job acknowledgement, or comma-separated priority queues.
 
@@ -538,6 +552,21 @@ if (($result['reason'] ?? null) === 'kv_precondition') {
 
 A lost precondition is the expected outcome of a legitimate redelivery, so `commit()` returns that
 verdict instead of throwing. It belongs in an `if`, not in a `catch`, and not in your error metrics.
+
+Three client options, off by default, send and read the messages in binary forms instead of
+JSON, for a high message rate against a broker newer than 2.2.0:
+
+```php
+$queen = new Queen([
+    'url' => 'http://localhost:6632',
+    'binaryPush' => true,       // a push travels as a binary body
+    'pushCompression' => true,  // with binaryPush: framed and compressed here (needs ext-zstd)
+    'framedPop' => true,        // a pop returns the stored records, unpacked here (needs ext-zstd)
+]);
+```
+
+The calls and their results do not change:
+[binary push, push compression and framed pop](REFERENCE.md#binary-push-push-compression-and-framed-pop).
 
 The rest of the surface — buffered push, multi-partition pop, pop autopilot, the pop that
 commits at delivery (`commitOnDelivery()`), conflation, the `KafkaConsumer`-style consumer,
