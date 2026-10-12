@@ -100,9 +100,10 @@ code {
     text-decoration: none;
 }
 .brand-mark {
-    width: 32px;
-    height: 32px;
-    color: var(--brand);
+    display: block;
+    width: auto;
+    height: 36px;
+    color: var(--text);
     flex: none;
 }
 .brand-name {
