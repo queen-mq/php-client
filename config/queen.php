@@ -71,6 +71,18 @@ return [
     // ack_batch <= prefetch bound and the lease budget all key off it, and
     // `partitions` still stripes pushes. Off keeps the wire bytes unchanged.
     'autopilot' => false,
+    // Opt-in wire forms, for a broker that has the binary push body and the
+    // framed pop answer; off, the driver sends and reads the JSON every broker
+    // knows. binary_push sends a dispatched job as the binary push body.
+    // push_compression, with binary_push, frames each pushed batch as the
+    // broker stores it and zstd-compresses it in the dispatching process, and
+    // a job released or handed back in a transaction travels the same way.
+    // framed_pop asks for the popped jobs as the stored records and unpacks
+    // them in the worker. push_compression and framed_pop need the zstd PHP
+    // extension, in the workers and in every process that dispatches.
+    'binary_push' => false,
+    'push_compression' => false,
+    'framed_pop' => false,
     // Opt-in lease renewal for jobs whose runtime cannot be bounded by the
     // original pop lease. The Rust supervisor on Linux renews the single lease
     // shared by a worker's active and prefetched jobs; elsewhere one small PHP

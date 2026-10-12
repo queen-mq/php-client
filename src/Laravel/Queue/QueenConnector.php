@@ -86,6 +86,16 @@ class QueenConnector implements ConnectorInterface
         }
         $dispatchAfterCommit = self::boolean($config['after_commit'] ?? false, 'after_commit');
         $popAutopilot = self::boolean($config['autopilot'] ?? false, 'autopilot');
+        // The client's wire forms (Http\PushBinary, Http\PopFrames): the
+        // driver's pushes, pops and transactions go through its client, so the
+        // client's options are all they need. The client refuses, when it is
+        // built, an option that needs the zstd extension where there is none.
+        $binaryPush = self::boolean($config['binary_push'] ?? $config['binaryPush'] ?? false, 'binary_push');
+        $pushCompression = self::boolean(
+            $config['push_compression'] ?? $config['pushCompression'] ?? false,
+            'push_compression',
+        );
+        $framedPop = self::boolean($config['framed_pop'] ?? $config['framedPop'] ?? false, 'framed_pop');
         $leaseRenewal = self::boolean($config['lease_renewal'] ?? false, 'lease_renewal');
         // The internal test handler override is exempt, and has to be: a
         // renewer builds its own Queen client, so lease_renewal refuses that
@@ -127,6 +137,9 @@ class QueenConnector implements ConnectorInterface
             'healthRetryAfterMillis' => $config['health_retry_after'] ?? $config['healthRetryAfterMillis'] ?? 30000,
             'headers' => $config['headers'] ?? [],
             'retry429' => $retry429,
+            'binaryPush' => $binaryPush,
+            'pushCompression' => $pushCompression,
+            'framedPop' => $framedPop,
         ];
 
         if (!empty($urls)) {

@@ -54,6 +54,9 @@ final class ApplicationSettings
         'partitions' => ['QUEEN_PARTITIONS', 'count', 64, 1, 1024, 'Partition stripes that ordinary jobs are spread over.'],
         'bulk_batch' => [null, 'count', 100, 1, 1000, 'Jobs in one push request of Queue::bulk().'],
         'after_commit' => [null, 'switch', false, 0, null, 'Dispatch a job only after the open database transaction commits.'],
+        'binary_push' => [null, 'switch', false, 0, null, 'Send pushed jobs as the binary push body instead of JSON. Needs a broker that reads it.'],
+        'push_compression' => [null, 'switch', false, 0, null, 'With binary_push: frame and zstd-compress each pushed batch here, also in a release or hand-back transaction. Needs the zstd extension.'],
+        'framed_pop' => [null, 'switch', false, 0, null, 'Pop jobs as the stored records and unpack them in the worker. Needs the zstd extension.'],
     ];
 
     /** @var array<string, array{0: ?string, 1: string, 2: int|bool|null, 3: int, 4: ?int, 5: string}> keys of queen.supervisor */

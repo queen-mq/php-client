@@ -58,6 +58,40 @@ class LaravelServiceProviderTest extends TestCase
         $this->assertInstanceOf(QueenQueue::class, $connection);
     }
 
+    public function testTheWireFormsOfThePackageConfigReachTheQueueConnection(): void
+    {
+        // binary_push in config/queen.php, and a connection that does not name
+        // it: the connector takes it from the package config, and the job
+        // leaves as the binary push body. (push_compression and framed_pop
+        // arrive the same way; they need the zstd extension to be turned on.)
+        $handler = new PlanHandler([['status' => 201, 'json' => [['status' => 'queued']]]]);
+        $this->app['config']->set('queen.binary_push', true);
+        $this->app['config']->set('queue.connections.queen', [
+            'driver' => 'queen',
+            'url' => 'http://queen.test:6632',
+            'handler' => HandlerStack::create($handler),
+        ]);
+
+        $connection = $this->app->make(QueueManager::class)->connection('queen');
+        $connection->pushRaw(json_encode(['uuid' => 'job-123', 'job' => 'Handler@handle', 'data' => []], JSON_THROW_ON_ERROR), 'emails');
+
+        $this->assertSame('application/x-queen-push', $handler->requests[0]->getHeaderLine('Content-Type'));
+        $this->assertSame('QPB1', substr((string) $handler->requests[0]->getBody(), 0, 4));
+
+        // A connection's own value wins over the package config.
+        $own = new PlanHandler([['status' => 201, 'json' => [['status' => 'queued']]]]);
+        $this->app['config']->set('queue.connections.plain', [
+            'driver' => 'queen',
+            'url' => 'http://queen.test:6632',
+            'handler' => HandlerStack::create($own),
+            'binary_push' => false,
+        ]);
+        $this->app->make(QueueManager::class)->connection('plain')
+            ->pushRaw(json_encode(['uuid' => 'job-124', 'job' => 'Handler@handle', 'data' => []], JSON_THROW_ON_ERROR), 'emails');
+
+        $this->assertSame('application/json', $own->requests[0]->getHeaderLine('Content-Type'));
+    }
+
     public function testExplicitConnectionOptionsOverridePackageDefaults(): void
     {
         $this->app['config']->set('queue.connections.queen', [

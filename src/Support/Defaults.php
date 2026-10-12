@@ -17,6 +17,24 @@ class Defaults
         // HTTP 429 backoff: ['maxAttempts' => int, 'baseMs' => int,
         // 'capMs' => int]. Empty = per-request-kind defaults (Retry429Policy).
         'retry429' => [],
+        // The three below need a broker that has the binary push body and the
+        // framed pop answer. Off, the client sends and reads the JSON every
+        // broker knows.
+        //
+        // binaryPush: a push goes out as the binary push body (Http\PushBinary)
+        // instead of JSON. Items with a trace id stay JSON.
+        'binaryPush' => false,
+        // pushCompression (with binaryPush): the client frames the messages as
+        // the broker stores them, mints their ids and zstd-compresses each
+        // partition's batch once; the broker keeps those bytes as they are. A
+        // transaction that pushes sends its pushes the same way, and the rest
+        // of the bundle as JSON in front of them. Needs the zstd extension.
+        'pushCompression' => false,
+        // framedPop: pops ask for the messages as the stored records
+        // (frames=true) and unpack them here (Http\PopFrames). A broker that
+        // does not know the parameter answers JSON, which is read as always.
+        // Needs the zstd extension.
+        'framedPop' => false,
     ];
 
     public const QUEUE_DEFAULTS = [

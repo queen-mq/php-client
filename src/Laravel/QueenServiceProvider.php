@@ -168,6 +168,11 @@ class QueenServiceProvider extends ServiceProvider
             'healthRetryAfterMillis' => $config['health_retry_after'] ?? 30000,
             'headers' => $config['headers'] ?? [],
             'retry429' => $retry429,
+            // The wire forms config/queen.php turns on for the driver are the
+            // container's client's too.
+            'binaryPush' => $config['binary_push'] ?? false,
+            'pushCompression' => $config['push_compression'] ?? false,
+            'framedPop' => $config['framed_pop'] ?? false,
         ];
 
         if (!empty($config['urls'])) {

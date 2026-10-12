@@ -563,6 +563,11 @@ class Queen
         if (!is_bool($config['enableFailover'])) {
             throw new \InvalidArgumentException('enableFailover must be a boolean');
         }
+        foreach (['binaryPush', 'pushCompression', 'framedPop'] as $name) {
+            if (!is_bool($config[$name])) {
+                throw new \InvalidArgumentException("{$name} must be a boolean");
+            }
+        }
         if ($config['bearerToken'] !== null && (
             !is_string($config['bearerToken'])
             || $config['bearerToken'] === ''
@@ -646,6 +651,11 @@ class Queen
         // Undocumented Guzzle handler override, threaded so tests can drive
         // the whole builder stack against a canned server.
         $handler = $this->config['handler'] ?? null;
+        $wireForms = [
+            'binaryPush' => $this->config['binaryPush'],
+            'pushCompression' => $this->config['pushCompression'],
+            'framedPop' => $this->config['framedPop'],
+        ];
 
         if (count($urls) === 1) {
             return new HttpClient([
@@ -657,7 +667,7 @@ class Queen
                 'headers' => $headers,
                 'retry429' => $retry429,
                 'handler' => $handler,
-            ]);
+            ] + $wireForms);
         }
 
         $loadBalancer = new LoadBalancer($urls, $this->config['loadBalancingStrategy'], [
@@ -675,7 +685,7 @@ class Queen
             'headers' => $headers,
             'retry429' => $retry429,
             'handler' => $handler,
-        ]);
+        ] + $wireForms);
     }
 
     private function buildAck(array $msg, bool|string $status, array $context, bool $hasIndividualStatus): array
