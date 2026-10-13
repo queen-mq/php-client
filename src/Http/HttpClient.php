@@ -5,6 +5,7 @@ namespace Queen\Http;
 use GuzzleHttp\Client;
 use GuzzleHttp\Handler\CurlMultiHandler;
 use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Promise\RejectedPromise;
 use GuzzleHttp\Promise\Promise;
 use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\Promise\Utils as PromiseUtils;
@@ -24,6 +25,37 @@ class HttpClient
 
     /** A detached request is written within the connect timeout, or dropped. */
     private const DETACHED_WRITE_MILLIS = 5_000;
+
+    /** 503 codes with which the broker says it did not run the request. */
+    private const NOT_RUN_CODES = ['no_leader', 'standby'];
+
+    /**
+     * 503 code with which the broker refused a request before it ran, unless
+     * a follower lost its relay to the leader after the request went out.
+     */
+    private const REFUSED_CODE = 'retry';
+
+    /** 503 codes after which the request may have run. */
+    private const MAY_HAVE_RUN_CODES = ['outcome_unknown', 'timeout', 'retry'];
+
+    /** The longest a request waits for a leader, when its timeout is longer. */
+    private const LEADER_WAIT_MAX_MILLIS = 10_000;
+
+    /** The pause while a leader is elected: Retry-After within these bounds. */
+    private const LEADER_WAIT_DEFAULT_PAUSE_MILLIS = 1_000;
+    private const LEADER_WAIT_MIN_PAUSE_MILLIS = 50;
+    private const LEADER_WAIT_MAX_PAUSE_MILLIS = 5_000;
+
+    /** Routes whose every answer is a JSON body; see answersWithJson(). */
+    private const JSON_ANSWER_PATHS = [
+        '/api/v1/push',
+        '/api/v1/ack',
+        '/api/v1/ack/batch',
+        '/api/v1/transaction',
+        '/api/v1/ephemeral/push',
+        '/api/v1/ephemeral/pop',
+        '/api/v1/ephemeral/ack',
+    ];
 
     private ?string $baseUrl;
     private ?LoadBalancer $loadBalancer;
@@ -139,13 +171,13 @@ class HttpClient
                 // the caller gets the results in the order of its own
                 // operations.
                 return PushBinary::restoreResultOrder(
-                    $this->requestWithFailover('POST', $path, $framed[0], $requestTimeoutMillis, $affinityKey, $retryKind),
+                    $this->requestWithFailover('POST', $path, $framed[0], $requestTimeoutMillis, $affinityKey, $retryKind, $body),
                     $framed[1],
                 );
             }
         }
 
-        return $this->requestWithFailover('POST', $path, $this->wireBody($path, $body), $requestTimeoutMillis, $affinityKey, $retryKind);
+        return $this->requestWithFailover('POST', $path, $this->wireBody($path, $body), $requestTimeoutMillis, $affinityKey, $retryKind, $body);
     }
 
     public function put(string $path, ?array $body = null, ?int $requestTimeoutMillis = null, ?string $affinityKey = null, ?string $retryKind = null): mixed
@@ -171,7 +203,7 @@ class HttpClient
 
     public function getAsync(string $path, ?int $requestTimeoutMillis = null, ?string $affinityKey = null): PromiseInterface
     {
-        return $this->executeRequestAsync($this->resolveUrl($affinityKey) . $this->popPath($path), 'GET', null, $requestTimeoutMillis);
+        return $this->requestAsyncReportingHealth('GET', $this->popPath($path), null, $requestTimeoutMillis, $affinityKey);
     }
 
     /**
@@ -199,17 +231,54 @@ class HttpClient
 
     public function postAsync(string $path, ?array $body = null, ?int $requestTimeoutMillis = null, ?string $affinityKey = null): PromiseInterface
     {
-        return $this->executeRequestAsync($this->resolveUrl($affinityKey) . $path, 'POST', $this->wireBody($path, $body), $requestTimeoutMillis);
+        return $this->requestAsyncReportingHealth('POST', $path, $this->wireBody($path, $body), $requestTimeoutMillis, $affinityKey);
     }
 
     public function putAsync(string $path, ?array $body = null, ?int $requestTimeoutMillis = null, ?string $affinityKey = null): PromiseInterface
     {
-        return $this->executeRequestAsync($this->resolveUrl($affinityKey) . $path, 'PUT', $body, $requestTimeoutMillis);
+        return $this->requestAsyncReportingHealth('PUT', $path, $body, $requestTimeoutMillis, $affinityKey);
     }
 
     public function deleteAsync(string $path, ?int $requestTimeoutMillis = null, ?string $affinityKey = null): PromiseInterface
     {
-        return $this->executeRequestAsync($this->resolveUrl($affinityKey) . $path, 'DELETE', null, $requestTimeoutMillis);
+        return $this->requestAsyncReportingHealth('DELETE', $path, null, $requestTimeoutMillis, $affinityKey);
+    }
+
+    /**
+     * One try against one backend, as before, but its outcome now reaches
+     * the balancer as a synchronous request's does: a backend that does not
+     * answer, or answers 5xx, is marked unhealthy, so the next request (the
+     * next poll round of a consume() with concurrency > 1) goes to another
+     * one instead of back to it for as long as the caller runs.
+     */
+    private function requestAsyncReportingHealth(
+        string $method,
+        string $path,
+        array|string|null $body,
+        ?int $requestTimeoutMillis,
+        ?string $affinityKey,
+    ): PromiseInterface {
+        $url = $this->resolveUrl($affinityKey);
+        $promise = $this->executeRequestAsync($url . $path, $method, $body, $requestTimeoutMillis);
+        $loadBalancer = $this->loadBalancer;
+        if ($loadBalancer === null) {
+            return $promise;
+        }
+
+        return $promise->then(
+            function (mixed $result) use ($loadBalancer, $url): mixed {
+                $loadBalancer->markHealthy($url);
+                return $result;
+            },
+            function (mixed $reason) use ($loadBalancer, $url): PromiseInterface {
+                $statusCode = $reason instanceof \Throwable ? $this->getStatusCode($reason) : 0;
+                if ($statusCode === 0 || $statusCode >= 500) {
+                    $loadBalancer->markUnhealthy($url);
+                }
+
+                return new RejectedPromise($reason);
+            },
+        );
     }
 
     // ===========================
@@ -276,8 +345,9 @@ class HttpClient
             };
         }
 
-        $promise = $this->detachedClient()->requestAsync($method, $this->resolveUrl($affinityKey) . $path, $options)
-            ->then(fn (ResponseInterface $response) => $this->parseResponse($response));
+        $url = $this->resolveUrl($affinityKey) . $path;
+        $promise = $this->detachedClient()->requestAsync($method, $url, $options)
+            ->then(fn (ResponseInterface $response) => $this->parseResponse($response, $url));
         if ($this->detachedHandler === null) {
             return $promise;
         }
@@ -321,7 +391,7 @@ class HttpClient
             unset($this->detached[$promise]);
             try {
                 $answer = $this->transport->settle($request, $timeoutMillis);
-                $result = $this->parseAnswer($answer['status'], $answer['body'], $answer['retryAfter']);
+                $result = $this->parseAnswer($answer['status'], $answer['body'], $answer['retryAfter'], $request->url);
             } catch (\Throwable $failure) {
                 $promise->reject($failure);
                 throw $failure;
@@ -445,7 +515,15 @@ class HttpClient
         return $path;
     }
 
-    /** A string body is already encoded (the binary push body). */
+    /**
+     * The request body as it goes on the wire, encoded once before any
+     * attempt: an array as JSON, a string as it is (a binary push or
+     * transaction body, already encoded). A body json_encode() refuses (a
+     * string that is not UTF-8, say) is the caller's error. Nothing is sent,
+     * so it must neither be retried nor count against the health of a backend.
+     *
+     * @throws JsonException
+     */
     private function encodeBody(array|string|null $body): ?string
     {
         return is_array($body) ? json_encode($body, JSON_THROW_ON_ERROR) : $body;
@@ -494,23 +572,55 @@ class HttpClient
         return $options;
     }
 
-    private function parseResponse(ResponseInterface $response): mixed
+    private function parseResponse(ResponseInterface $response, string $url): mixed
     {
         return $this->parseAnswer(
             $response->getStatusCode(),
             (string) $response->getBody(),
             $response->getHeaderLine('Retry-After'),
+            $url,
         );
     }
 
-    private function parseAnswer(int $statusCode, string $responseBody, string $retryAfter): mixed
+    /**
+     * Whether an answer to $url must carry a JSON body. The message path
+     * always answers one, except for an empty pop, which is a bodiless 204:
+     * an empty answer there confirms nothing (a gateway's, say), so it must
+     * not read as a stored push or a successful acknowledgement. The other
+     * routes keep reading an empty answer as null.
+     */
+    private static function answersWithJson(string $url, int $statusCode): bool
     {
-        if ($statusCode === 204) {
+        $path = (string) parse_url($url, PHP_URL_PATH);
+        if (str_starts_with($path, '/api/v1/pop')) {
+            return $statusCode !== 204;
+        }
+
+        return in_array($path, self::JSON_ANSWER_PATHS, true);
+    }
+
+    /**
+     * A redirect or a client error: the same request cannot succeed by being
+     * sent again, here or to another backend.
+     */
+    private static function isTerminalStatus(int $statusCode): bool
+    {
+        return $statusCode >= 300 && $statusCode < 500;
+    }
+
+    private function parseAnswer(int $statusCode, string $responseBody, string $retryAfter, string $url = ''): mixed
+    {
+        if ($statusCode === 204 && !self::answersWithJson($url, $statusCode)) {
             return null;
         }
 
-        if ($statusCode >= 400) {
-            $error = "HTTP {$statusCode}";
+        // A redirect is never followed (it could carry the bearer token to
+        // another host), so it answers nothing that was asked: an error, like
+        // a 4xx, and never a success with an empty result.
+        if ($statusCode >= 300) {
+            $error = $statusCode < 400
+                ? "HTTP {$statusCode}: Queen answered with a redirect, which the client does not follow; check the Queen URL"
+                : "HTTP {$statusCode}";
             $serverError = null;
             $errorCode = null;
             $reason = null;
@@ -541,7 +651,9 @@ class HttpClient
                 }
             }
 
-            $retryAfterSeconds = $statusCode === 429
+            // 429: rate limited. 503: the broker is electing a leader or is
+            // otherwise briefly unavailable, and says when to come back.
+            $retryAfterSeconds = $statusCode === 429 || $statusCode === 503
                 ? $this->parseRetryAfter($retryAfter)
                 : null;
 
@@ -571,6 +683,15 @@ class HttpClient
         }
 
         if (empty($responseBody)) {
+            if (self::answersWithJson($url, $statusCode)) {
+                // Like a malformed body: a transport failure, so the normal
+                // retry/failover boundary runs and the caller fails closed.
+                throw new UnexpectedValueException(
+                    "Queen answered HTTP {$statusCode} without a body, where a JSON answer was expected; "
+                    . 'nothing confirms the request took effect.',
+                );
+            }
+
             return null;
         }
 
@@ -609,23 +730,32 @@ class HttpClient
         return is_finite($seconds) && $seconds >= 0 ? $seconds : null;
     }
 
-    private function executeRequest(string $url, string $method, array|string|null $body = null, ?int $requestTimeoutMillis = null): mixed
+    /**
+     * $payload is the body as encodeBody() made it. $binary says it is a
+     * binary body and not JSON, so that it is announced as one.
+     */
+    private function executeRequest(string $url, string $method, ?string $payload = null, ?int $requestTimeoutMillis = null, bool $binary = false): mixed
     {
         if ($this->transport !== null) {
             $answer = $this->transport->request(
                 $method,
                 $url,
-                $this->requestHeaders($body),
-                $this->encodeBody($body),
+                $this->requestHeaders($binary ? $payload : null),
+                $payload,
                 $requestTimeoutMillis ?? $this->timeoutMillis,
             );
 
-            return $this->parseAnswer($answer['status'], $answer['body'], $answer['retryAfter']);
+            return $this->parseAnswer($answer['status'], $answer['body'], $answer['retryAfter'], $url);
         }
 
-        $options = $this->buildRequestOptions($method, $body, $requestTimeoutMillis);
+        $options = $this->buildRequestOptions($method, $binary ? $payload : null, $requestTimeoutMillis);
+        if ($payload !== null) {
+            // The bytes Guzzle's 'json' option would send, or the binary
+            // body; the Content-Type header is already set for either.
+            $options['body'] = $payload;
+        }
         $response = $this->guzzle->request($method, $url, $options);
-        return $this->parseResponse($response);
+        return $this->parseResponse($response, $url);
     }
 
     /**
@@ -636,7 +766,7 @@ class HttpClient
      * only status this layer retries, and 5xx/network retry plus
      * cross-backend failover stay with the callers below.
      */
-    private function executeRequestWithRetry429(string $url, string $method, array|string|null $body, ?int $requestTimeoutMillis, ?string $retryKind): mixed
+    private function executeRequestWithRetry429(string $url, string $method, ?string $payload, ?int $requestTimeoutMillis, ?string $retryKind, bool $binary = false): mixed
     {
         $policy = Retry429Policy::forKind($this->retry429, $retryKind);
         $tries = 0;
@@ -645,7 +775,7 @@ class HttpClient
             $tries++;
 
             try {
-                return $this->executeRequest($url, $method, $body, $requestTimeoutMillis);
+                return $this->executeRequest($url, $method, $payload, $requestTimeoutMillis, $binary);
             } catch (HttpException $error) {
                 if ($error->statusCode !== 429 || $policy->isExhausted($tries)) {
                     throw $error;
@@ -672,7 +802,7 @@ class HttpClient
         }
 
         return $this->guzzle->requestAsync($method, $url, $options)->then(
-            fn(ResponseInterface $response) => $this->parseResponse($response)
+            fn(ResponseInterface $response) => $this->parseResponse($response, $url)
         );
     }
 
@@ -696,7 +826,7 @@ class HttpClient
                     : new \RuntimeException('Queen async request failed with a non-exception rejection.');
                 $statusCode = $this->getStatusCode($error);
                 $nextAttempt = $attempt + 1;
-                if (($statusCode >= 400 && $statusCode < 500) || $nextAttempt >= $this->retryAttempts) {
+                if (self::isTerminalStatus($statusCode) || $nextAttempt >= $this->retryAttempts) {
                     throw $error;
                 }
 
@@ -737,7 +867,7 @@ class HttpClient
                 if ($statusCode === 0 || $statusCode >= 500) {
                     $this->loadBalancer?->markUnhealthy($url);
                 }
-                if (($statusCode >= 400 && $statusCode < 500) || !isset($urls[$index + 1])) {
+                if (self::isTerminalStatus($statusCode) || !isset($urls[$index + 1])) {
                     throw $error;
                 }
 
@@ -758,76 +888,232 @@ class HttpClient
         return ($error instanceof HttpException) ? $error->statusCode : 0;
     }
 
-    private function requestWithRetry(string $method, string $path, array|string|null $body = null, ?int $requestTimeoutMillis = null, ?string $affinityKey = null, ?string $retryKind = null): mixed
+
+    // ===========================
+    // Leader elections
+    // ===========================
+    //
+    // A raft cluster answers 503 for a few seconds while it elects a leader,
+    // and its `code` says whether the request ran (server: RsmError and the
+    // follower's relay in handlers/raft.rs):
+    //
+    //   no_leader, standby         it did not run;
+    //   retry                      refused before it ran, or a follower lost
+    //                              its relay to the leader after it went out;
+    //   outcome_unknown, timeout   it may have run.
+    //
+    // A request whose second run changes nothing waits the election out, at
+    // the pace of Retry-After and within a bounded budget, instead of failing
+    // after the few quick attempts the retry loops make. A pop is never sent
+    // again after a 503 that leaves its outcome unknown.
+
+    /**
+     * The 503 codes after which this request may be sent again while the
+     * cluster elects a leader:
+     *
+     * - a read, or a push whose every item has a transactionId (the broker
+     *   deduplicates it): a second run changes nothing, so after any 503 that
+     *   says it did not run or was refused;
+     * - a pop or an ACK: only after a 503 that says it did not run, since a
+     *   second run of one that ran claims other messages, or calls the
+     *   messages it acknowledged stale;
+     * - anything else: none, and it keeps the retryAttempts it had.
+     *
+     * @return list<string>
+     */
+    private static function resendableCodes(string $method, string $path, ?array $body): array
     {
-        $lastError = null;
-
-        for ($attempt = 0; $attempt < $this->retryAttempts; $attempt++) {
-            try {
-                $url = $this->resolveUrl($affinityKey) . $path;
-                return $this->executeRequestWithRetry429($url, $method, $body, $requestTimeoutMillis, $retryKind);
-            } catch (\Throwable $error) {
-                $lastError = $error;
-
-                $statusCode = $this->getStatusCode($error);
-                if ($statusCode >= 400 && $statusCode < 500) {
-                    throw $error;
-                }
-
-                if ($attempt < $this->retryAttempts - 1) {
-                    $delay = $this->retryDelayMillis * (2 ** $attempt);
-                    usleep($delay * 1000);
-                }
-            }
+        $route = (string) parse_url($path, PHP_URL_PATH);
+        if (self::isPopRoute($route)
+            || ($method === 'POST' && in_array($route, ['/api/v1/ack', '/api/v1/ack/batch'], true))) {
+            return self::NOT_RUN_CODES;
+        }
+        if ($method === 'GET'
+            || ($method === 'POST' && $route === '/api/v1/push' && self::everyItemHasTransactionId($body))) {
+            return [...self::NOT_RUN_CODES, self::REFUSED_CODE];
         }
 
-        throw $lastError;
+        return [];
     }
 
-    private function requestWithFailover(string $method, string $path, array|string|null $body = null, ?int $requestTimeoutMillis = null, ?string $affinityKey = null, ?string $retryKind = null): mixed
+    private static function isPopRoute(string $route): bool
     {
-        if ($this->loadBalancer === null || !$this->enableFailover) {
-            return $this->requestWithRetry($method, $path, $body, $requestTimeoutMillis, $affinityKey, $retryKind);
+        return str_starts_with($route, '/api/v1/pop') || $route === '/api/v1/ephemeral/pop';
+    }
+
+    private static function everyItemHasTransactionId(?array $body): bool
+    {
+        $items = $body['items'] ?? null;
+        if (!is_array($items) || $items === []) {
+            return false;
+        }
+        foreach ($items as $item) {
+            if (!is_array($item) || !is_string($item['transactionId'] ?? null) || $item['transactionId'] === '') {
+                return false;
+            }
         }
 
-        $urls = $this->loadBalancer->getAllUrls();
-        $attemptedUrls = [];
-        $lastError = null;
+        return true;
+    }
 
-        for ($i = 0; $i < count($urls); $i++) {
-            $url = $this->loadBalancer->getNextUrl($affinityKey);
+    /** A 503 that names the request one the broker may have run, on a pop. */
+    private static function isUnknownPopOutcome(string $path, \Throwable $error): bool
+    {
+        return $error instanceof HttpException
+            && $error->statusCode === 503
+            && in_array($error->errorCode, self::MAY_HAVE_RUN_CODES, true)
+            && self::isPopRoute((string) parse_url($path, PHP_URL_PATH));
+    }
 
-            if (in_array($url, $attemptedUrls, true)) {
-                continue;
-            }
+    /** @param list<string> $resendableCodes */
+    private static function isElectionAnswer(\Throwable $error, array $resendableCodes): bool
+    {
+        return $error instanceof HttpException
+            && $error->statusCode === 503
+            && in_array($error->errorCode, $resendableCodes, true);
+    }
 
-            $attemptedUrls[] = $url;
+    /**
+     * The pause before the request is sent again, in milliseconds: the 503's
+     * Retry-After, within bounds. Null once the next attempt could not start
+     * inside the budget, the shorter of LEADER_WAIT_MAX_MILLIS and the
+     * request's own timeout.
+     */
+    private function leaderWaitPause(HttpException $error, int $startedNanos, ?int $requestTimeoutMillis): ?int
+    {
+        $pause = $error->retryAfterSeconds !== null
+            ? (int) round(min($error->retryAfterSeconds * 1000, self::LEADER_WAIT_MAX_PAUSE_MILLIS))
+            : self::LEADER_WAIT_DEFAULT_PAUSE_MILLIS;
+        $pause = max($pause, self::LEADER_WAIT_MIN_PAUSE_MILLIS);
+        $budget = min(self::LEADER_WAIT_MAX_MILLIS, $requestTimeoutMillis ?? $this->timeoutMillis);
+        $elapsed = intdiv(hrtime(true) - $startedNanos, 1_000_000);
 
+        return $elapsed + $pause <= $budget ? $pause : null;
+    }
+
+    /**
+     * $body: an array goes out as JSON, a string as it is (a binary push or
+     * transaction body). $asked is the array a binary body was built from,
+     * read for one thing: whether the request may be sent again while the
+     * cluster elects a leader. The same bytes go out at every attempt, so a
+     * binary push is deduplicated as its JSON form would be.
+     */
+    private function requestWithRetry(string $method, string $path, array|string|null $body = null, ?int $requestTimeoutMillis = null, ?string $affinityKey = null, ?string $retryKind = null, ?array $asked = null): mixed
+    {
+        $payload = $this->encodeBody($body);
+        $binary = is_string($body);
+        $resendableCodes = self::resendableCodes($method, $path, is_array($body) ? $body : $asked);
+        $startedNanos = hrtime(true);
+        $attempt = 0;
+
+        while (true) {
             try {
-                // 429s are retried in place against this same backend inside
-                // executeRequestWithRetry429: rate limiting is a tenant-quota
-                // signal, not a backend-health one, so it must neither mark
-                // the server unhealthy nor fail over to another (every backend
-                // would answer the same, and spraying the fleet only makes the
-                // limiter angrier). An exhausted 429 is a 4xx and therefore
-                // leaves the loop below without a second server being tried.
-                $result = $this->executeRequestWithRetry429($url . $path, $method, $body, $requestTimeoutMillis, $retryKind);
-                $this->loadBalancer->markHealthy($url);
-                return $result;
+                $url = $this->resolveUrl($affinityKey) . $path;
+                return $this->executeRequestWithRetry429($url, $method, $payload, $requestTimeoutMillis, $retryKind, $binary);
             } catch (\Throwable $error) {
-                $lastError = $error;
-
                 $statusCode = $this->getStatusCode($error);
-                if ($statusCode === 0 || $statusCode >= 500) {
-                    $this->loadBalancer->markUnhealthy($url);
-                }
-
-                if ($statusCode >= 400 && $statusCode < 500) {
+                if (self::isTerminalStatus($statusCode) || self::isUnknownPopOutcome($path, $error)) {
                     throw $error;
                 }
+
+                // An election uses up no attempt: it is waited out within
+                // its own budget.
+                if (self::isElectionAnswer($error, $resendableCodes)) {
+                    $pause = $this->leaderWaitPause($error, $startedNanos, $requestTimeoutMillis);
+                    if ($pause === null) {
+                        throw $error;
+                    }
+                    usleep($pause * 1000);
+                    continue;
+                }
+
+                $attempt++;
+                if ($attempt >= $this->retryAttempts) {
+                    throw $error;
+                }
+                $delay = $this->retryDelayMillis * (2 ** ($attempt - 1));
+                usleep($delay * 1000);
             }
         }
+    }
 
-        throw $lastError ?? new \RuntimeException('All servers failed');
+    /** $body and $asked: as in requestWithRetry(). */
+    private function requestWithFailover(string $method, string $path, array|string|null $body = null, ?int $requestTimeoutMillis = null, ?string $affinityKey = null, ?string $retryKind = null, ?array $asked = null): mixed
+    {
+        if ($this->loadBalancer === null || !$this->enableFailover) {
+            return $this->requestWithRetry($method, $path, $body, $requestTimeoutMillis, $affinityKey, $retryKind, $asked);
+        }
+
+        $payload = $this->encodeBody($body);
+        $binary = is_string($body);
+        $resendableCodes = self::resendableCodes($method, $path, is_array($body) ? $body : $asked);
+        // A read or a deduplicated push may be sent again after any failure;
+        // a pop or an ACK only after a 503 that says it did not run.
+        $resendsHarmlessly = in_array(self::REFUSED_CODE, $resendableCodes, true);
+        $startedNanos = hrtime(true);
+        // A URL listed twice is one backend.
+        $urls = array_values(array_unique($this->loadBalancer->getAllUrls()));
+
+        while (true) {
+            $attemptedUrls = [];
+            $lastError = null;
+            $electionAnswer = null;
+            $harmless = true;
+
+            while (count($attemptedUrls) < count($urls)) {
+                $url = $this->loadBalancer->getNextUrl($affinityKey);
+
+                if (in_array($url, $attemptedUrls, true)) {
+                    // The balancer offers a backend this call already tried, as it
+                    // does when every backend is marked unhealthy (a leader
+                    // election marks them all): go on with the ones not tried yet,
+                    // in order, rather than give up with them untried.
+                    $url = array_values(array_diff($urls, $attemptedUrls))[0];
+                }
+
+                $attemptedUrls[] = $url;
+
+                try {
+                    // 429s are retried in place against this same backend inside
+                    // executeRequestWithRetry429: rate limiting is a tenant-quota
+                    // signal, not a backend-health one, so it must neither mark
+                    // the server unhealthy nor fail over to another (every backend
+                    // would answer the same, and spraying the fleet only makes the
+                    // limiter angrier). An exhausted 429 is a 4xx and therefore
+                    // leaves the loop below without a second server being tried.
+                    $result = $this->executeRequestWithRetry429($url . $path, $method, $payload, $requestTimeoutMillis, $retryKind, $binary);
+                    $this->loadBalancer->markHealthy($url);
+                    return $result;
+                } catch (\Throwable $error) {
+                    $lastError = $error;
+
+                    $statusCode = $this->getStatusCode($error);
+                    if ($statusCode === 0 || $statusCode >= 500) {
+                        $this->loadBalancer->markUnhealthy($url);
+                    }
+
+                    if (self::isTerminalStatus($statusCode) || self::isUnknownPopOutcome($path, $error)) {
+                        throw $error;
+                    }
+
+                    if (self::isElectionAnswer($error, $resendableCodes)) {
+                        $electionAnswer = $error;
+                    } elseif (!$resendsHarmlessly) {
+                        $harmless = false;
+                    }
+                }
+            }
+
+            // Every backend failed. While the cluster elects a leader, wait
+            // and go round again, unless a backend failed in a way that leaves
+            // this request's outcome unknown.
+            $pause = $electionAnswer !== null && $harmless
+                ? $this->leaderWaitPause($electionAnswer, $startedNanos, $requestTimeoutMillis)
+                : null;
+            if ($pause === null) {
+                throw $lastError ?? new \RuntimeException('All servers failed');
+            }
+            usleep($pause * 1000);
+        }
     }
 }
