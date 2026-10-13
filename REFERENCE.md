@@ -1181,7 +1181,7 @@ These stay JSON, with nothing to do in your code:
 answers a binary transaction with the acks first and the pushes after them; the client puts them
 back and rewrites each `index`.
 
-The binary push and transaction bodies need a broker newer than 2.2.0. A broker up to 2.2.0
+The binary push and transaction bodies need broker 2.3.0 or later. A broker up to 2.2.0
 answers them with HTTP 400 (an `HttpException`), and the client does not fall back to JSON:
 turn `binaryPush` and `pushCompression` on after every broker of the cluster is upgraded.
 `framedPop` is safe against any broker: an older one ignores the parameter and answers JSON.

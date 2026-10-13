@@ -285,9 +285,9 @@ and the broker, and nothing else: the jobs, their order and their delivery stay 
 that stops, travels the same way inside its transaction. A delayed job is a timer and stays JSON.
 `push_compression` and `framed_pop` need the zstd PHP extension (`pecl install zstd`) in the
 workers and in every process that dispatches; without it the connection throws when it is built.
-The binary bodies need a broker newer than 2.2.0, and one up to 2.2.0 answers them with 400, so
+The binary bodies need broker 2.3.0 or later, and one up to 2.2.0 answers them with 400, so
 turn the two push settings on after the brokers are upgraded. `framed_pop` is safe against any
-broker.
+broker. The three settings are in 2.5.0.
 [Binary push, push compression and framed pop](REFERENCE.md#binary-push-push-compression-and-framed-pop).
 
 Keep `prefetch=1` for long jobs, strict per-job acknowledgement, or comma-separated priority queues.
@@ -554,7 +554,7 @@ A lost precondition is the expected outcome of a legitimate redelivery, so `comm
 verdict instead of throwing. It belongs in an `if`, not in a `catch`, and not in your error metrics.
 
 Three client options, off by default, send and read the messages in binary forms instead of
-JSON, for a high message rate against a broker newer than 2.2.0:
+JSON, for a high message rate against broker 2.3.0 or later:
 
 ```php
 $queen = new Queen([
